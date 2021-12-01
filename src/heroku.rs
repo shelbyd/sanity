@@ -120,7 +120,7 @@ fn match_addons(config: &Config) -> anyhow::Result<()> {
             }
             SetAction::Remove(addon) => {
                 run(format!(
-                    "heroku addons:detach {addon} --app {app}",
+                    "heroku addons:destroy {addon} --app {app} --confirm {app}",
                     addon = addon,
                     app = config.app
                 ))?;
@@ -136,12 +136,7 @@ fn current_addons(config: &Config) -> anyhow::Result<HashSet<String>> {
     match output_json {
         json::JsonValue::Array(val) => Ok(val
             .into_iter()
-            .map(|obj| {
-                obj["addon_service"]["cli_plugin_name"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
+            .map(|obj| obj["addon_service"]["name"].as_str().unwrap().to_owned())
             .collect()),
         _ => {
             anyhow::bail!("Expected json array");
