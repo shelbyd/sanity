@@ -1,6 +1,10 @@
 use regex::Regex;
 use serde::*;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    path::{Path, PathBuf},
+};
 
 use crate::utils::run;
 
@@ -14,10 +18,14 @@ pub struct Config {
 
     #[serde(default)]
     copy_to_root: Vec<PathBuf>,
+
+    #[serde(default)]
+    addons: HashSet<String>,
 }
 
 pub fn deploy(path: &Path, config: Config) -> anyhow::Result<()> {
     match_buildpacks(&config)?;
+    match_addons(&config)?;
     copy_files_to_root(path, &config.copy_to_root)?;
     let deploy_tag = create_deploy_branch(&config)?;
     run(format!(
@@ -30,18 +38,16 @@ pub fn deploy(path: &Path, config: Config) -> anyhow::Result<()> {
 }
 
 fn match_buildpacks(config: &Config) -> anyhow::Result<()> {
-    while let Some(action) =
-        next_match_action(&dbg!(current_buildpacks(config)?), &config.buildpacks)
-    {
+    while let Some(action) = next_match_action(&current_buildpacks(config)?, &config.buildpacks) {
         match action {
-            Action::Remove(i) => {
+            ListAction::Remove(i) => {
                 run(format!(
                     "heroku buildpacks:remove --app {} --index {}",
                     config.app,
                     i + 1
                 ))?;
             }
-            Action::Insert(i, v) => {
+            ListAction::Insert(i, v) => {
                 run(format!(
                     "heroku buildpacks:add --app {} --index {} {}",
                     config.app,
@@ -77,29 +83,86 @@ fn current_buildpacks(config: &Config) -> anyhow::Result<Vec<String>> {
     }
 }
 
-fn next_match_action<'t, T: PartialEq>(from: &'t [T], to: &'t [T]) -> Option<Action<&'t T>> {
+fn next_match_action<'t, T: PartialEq>(from: &'t [T], to: &'t [T]) -> Option<ListAction<&'t T>> {
     match (from, to) {
         ([], []) => None,
-        ([first_from, ..], [first_to, ..]) if first_from != first_to => Some(Action::Remove(0)),
-        ([_, ..], []) => Some(Action::Remove(0)),
-        ([], [first_to, ..]) => Some(Action::Insert(0, first_to)),
+        ([first_from, ..], [first_to, ..]) if first_from != first_to => Some(ListAction::Remove(0)),
+        ([_, ..], []) => Some(ListAction::Remove(0)),
+        ([], [first_to, ..]) => Some(ListAction::Insert(0, first_to)),
         ([_, from @ ..], [_, to @ ..]) => next_match_action(from, to).map(|a| a.add_one()),
     }
 }
 
 #[derive(Debug)]
-enum Action<T> {
+enum ListAction<T> {
     Remove(usize),
     Insert(usize, T),
 }
 
-impl<T> Action<T> {
+impl<T> ListAction<T> {
     fn add_one(self) -> Self {
         match self {
-            Action::Remove(i) => Action::Remove(i + 1),
-            Action::Insert(i, t) => Action::Insert(i + 1, t),
+            ListAction::Remove(i) => ListAction::Remove(i + 1),
+            ListAction::Insert(i, t) => ListAction::Insert(i + 1, t),
         }
     }
+}
+
+fn match_addons(config: &Config) -> anyhow::Result<()> {
+    while let Some(action) = next_match_set_action(&current_addons(config)?, &config.addons) {
+        match action {
+            SetAction::Add(addon) => {
+                run(format!(
+                    "heroku addons:create {addon} --app {app}",
+                    addon = addon,
+                    app = config.app
+                ))?;
+            }
+            SetAction::Remove(addon) => {
+                run(format!(
+                    "heroku addons:detach {addon} --app {app}",
+                    addon = addon,
+                    app = config.app
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn current_addons(config: &Config) -> anyhow::Result<HashSet<String>> {
+    let output = run(format!("heroku addons --app {} --json", config.app))?;
+    let output_json = json::parse(&output)?;
+    match output_json {
+        json::JsonValue::Array(val) => Ok(val
+            .into_iter()
+            .map(|obj| {
+                obj["addon_service"]["cli_plugin_name"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()),
+        _ => {
+            anyhow::bail!("Expected json array");
+        }
+    }
+}
+
+fn next_match_set_action<'t, T: Eq + Hash>(
+    from: &'t HashSet<T>,
+    to: &'t HashSet<T>,
+) -> Option<SetAction<&'t T>> {
+    to.difference(from)
+        .next()
+        .map(SetAction::Add)
+        .or_else(|| from.difference(to).next().map(SetAction::Remove))
+}
+
+#[derive(Debug)]
+enum SetAction<T> {
+    Remove(T),
+    Add(T),
 }
 
 fn copy_files_to_root(sub_dir: &Path, files: &[PathBuf]) -> anyhow::Result<()> {
